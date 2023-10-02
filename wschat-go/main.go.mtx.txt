@@ -1,0 +1,113 @@
+package main
+
+import (
+  "encoding/json"
+  "errors"
+  "fmt"
+  "io"
+  "log"
+  "net/http"
+  "os"
+  "sync"
+  //"time"
+
+  uuidpkg "github.com/google/uuid"
+  webs "golang.org/x/net/websocket"
+  "wschat/wschat-go/common"
+)
+
+var (
+  // map[UUID]*webs.Conn
+  clients = make(map[string]*webs.Conn)
+  clientsMtx sync.RWMutex
+)
+
+func main() {
+  log.SetFlags(log.Lshortfile)
+  if len(os.Args) != 2 {
+    log.Fatal("must provide the address (and only the address)")
+  }
+  addr := os.Args[1]
+  http.Handle("/", webs.Handler(handler))
+  http.HandleFunc("/num", func(w http.ResponseWriter, r *http.Request) {
+    clientsMtx.Lock()
+    fmt.Fprintf(w, "%d", len(clients))
+    clientsMtx.Unlock()
+  })
+  log.Printf("Listening on %s", addr)
+  log.Fatal(http.ListenAndServe(addr, nil))
+}
+
+func handler(ws *webs.Conn) {
+  defer ws.Close()
+  uuid := uuidpkg.New().String()
+  logFunc := func(format string, args ...any) {
+    log.Output(
+      2,
+      fmt.Sprintf(
+        fmt.Sprintf("[%s|%s] %s", ws.Request().RemoteAddr, uuid, format),
+        args...,
+      ),
+    )
+  }
+
+  msg := common.NewSystemMessage(common.ActionConnect, uuid)
+  msgJSONBytes, err := json.Marshal(msg)
+  if err != nil {
+    webs.JSON.Send(ws, common.NewSystemMessage(common.ActionError, "internal server error"))
+    logFunc("error marshaling json: %v", err)
+    return
+  }
+  // Don't add ws to clients until after sending connect so that messages
+  // aren't received before the connect is sent to all.
+  broadcastMsgBytes(msgJSONBytes)
+  ws.Write(msgJSONBytes)
+  clientsMtx.Lock()
+  clients[uuid] = ws
+  clientsMtx.Unlock()
+
+  defer func() {
+    //clients.Delete(uuid)
+    msg := common.NewSystemMessage(common.ActionDisconnect, uuid)
+    /*
+    if msgJSONBytes, err := json.Marshal(msg); err == nil {
+      ws.Write(msgJSONBytes)
+      broadcastMsgBytes(msgJSONBytes)
+    }
+    */
+    broadcastMsg(msg)
+    clientsMtx.Lock()
+    delete(clients, uuid)
+    clientsMtx.Unlock()
+  }()
+
+  unmarshalTypeError := &json.UnmarshalTypeError{}
+  for {
+    if err := webs.JSON.Receive(ws, &msg); err != nil {
+      if errors.As(err, &unmarshalTypeError) {
+        webs.JSON.Send(ws, common.NewSystemMessage(common.ActionError, "bad message"))
+      } else if err != io.EOF {
+        logFunc("error reading from client: %v", err)
+      }
+      return
+    }
+    broadcastMsg(common.NewChatMessage(uuid, msg.Contents))
+  }
+}
+
+func broadcastMsg(msg common.Message) error {
+  msgJSONBytes, err := json.Marshal(msg)
+  if err != nil {
+    return err
+  }
+  broadcastMsgBytes(msgJSONBytes)
+  return nil
+}
+
+func broadcastMsgBytes(b []byte) {
+  clientsMtx.Lock()
+  for _, ws := range clients {
+    ws.Write(b)
+  }
+  clientsMtx.Unlock()
+}

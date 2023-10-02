@@ -1,0 +1,68 @@
+#pragma once
+
+#include <string>      // string, to_string
+//#include <string_view> // string_view
+
+namespace message {
+
+enum class Action {
+  Connect,
+  Chat,
+  Disconnect,
+  Error,
+};
+
+const char *action_str(Action action) {
+  switch (action) {
+  case Action::Connect:
+    return "connect";
+  case Action::Chat:
+    return "chat";
+  case Action::Disconnect:
+    return "disconnect";
+  case Action::Error:
+    return "error";
+  default:
+    return "";
+  }
+}
+
+/*
+Action action_from_string(std::string_view sv) {
+  if (sv == "connect") {
+    return Action::Connect;
+  } else if (sv == "chat") {
+    return Action::Chat;
+  } else if (sv == "disconnect") {
+    return Action::Disconnect;
+  } else if (sv == "error") {
+    return Action::Error;
+  }
+  return Action::Error;
+  //throw InvalidActionError("invalid action: " + std::string(sv));
+}
+*/
+
+struct Message {
+  std::string sender;
+  Action action;
+  std::string contents;
+  int64_t timestamp;
+
+  Message() : sender(""), action(Action::Error), contents(""), timestamp(0) {}
+  // Deserialize a JSON string
+  Message(std::string_view sv) { this->deserialize(sv); }
+  Message(Action action, std::string contents)
+      : sender("system"), action(action), contents(contents),
+        timestamp(0) {}
+  Message(std::string sender, std::string contents)
+      : sender(sender), action(Action::Chat), contents(contents),
+        timestamp(0) {}
+
+  void deserialize(std::string sv) {
+  }
+
+  std::string serialize() const {
+    return "";
+  }
+};

@@ -1,0 +1,712 @@
+#pragma once
+
+#include <cstdlib>
+#include <memory>
+#include <utility>
+
+#include "message.hpp"
+
+#include <boost/asio.hpp> // asio, asio::ip::tcp
+#include <boost/asio/signal_set.hpp> // signal_set?
+#include <boost/beast.hpp> // beast, beast::http, beast::websocket
+//#include <boost/optional.hpp> // optional
+#include <boost/smart_ptr.hpp> // enable_shared_from_this, make_shared, shared_ptr
+//#include <boost/config.hpp> // optional
+
+//#include <cstdlib>
+#include <iostream> // cerr, cout
+//#include <memory>
+#include <mutex> // unique_lock
+#include <optional> // optional
+#include <queue> // queue
+#include <shared_mutex> // shared_lock, shared_mutex
+#include <string> // string
+#include <string_view> // string_view
+#include <thread> // thread
+#include <unordered_set> // unordered_set
+#include <vector> // vector
+
+namespace net = boost::asio;
+using tcp = boost::asio::ip::tcp;
+namespace beast = boost::beast;
+namespace http = beast::http;
+namespace websocket = beast::websocket;
+using namespace message;
+
+void die(const char *msg) {
+  std::cerr << msg << std::endl;
+  std::exit(1);
+}
+
+//class WsConn;
+class Server;
+
+class Listener : public boost::enable_shared_from_this<Listener> {
+  net::io_context& ioc_;
+  tcp::acceptor acceptor_;
+  boost::shared_ptr<Server> server_;
+
+  void fail(beast::error_code, char const*);
+  void handle(beast::error_code, tcp::socket);
+public:
+  Listener(net::io_context&, tcp::endpoint, boost::shared_ptr<Server> const&);
+  void run();
+};
+
+class WsConn : public boost::enable_shared_from_this<Server> {
+  beast::flat_buffer buffer_;
+  websocket::stream<beast::tcp_stream> ws_;
+  boost::shared_ptr<Server> server_;
+  std::queue<boost::shared_ptr<std::string const>> queue_;
+
+  void fail(beast::error_code, char const*);
+  void accept(beast::error_code);
+  void handle(beast::error_code, std::size_t);
+  void on_write(beast::error_code, std::size_t);
+  void on_send(boost::shared_ptr<std::string const> const&);
+
+public:
+  WsConn(tcp::socket&&, boost::shared_ptr<Server> const&);
+  ~WsConn();
+
+  template<class Body, class Allocator>
+  void run(http::request<Body, http::basic_fields<Allocator>>);
+  void send(boost::shared_ptr<std::string const> const&);
+};
+
+class HttpSession: public boost::enable_shared_from_this<HttpSession> {
+  beast::tcp_stream stream_;
+  beast::flat_buffer buffer_;
+  boost::shared_ptr<Server> server_;
+  // The parser is stored as optional so we can construct it from scratch at
+  // beginning of each new message.
+  boost::optional<http::request_parser<http::string_body>> parser_;
+
+  struct send_lambda;
+
+  void fail(beast::error_code, char const*);
+  void do_read();
+  void handle(beast::error_code, std::size_t);
+  void on_write(beast::error_code, std::size_t, bool);
+
+public:
+  HttpSession(tcp::socket&&, boost::shared_ptr<Server> const&);
+
+  void run();
+
+  template<class Body, class Allocator>
+  http::message_generator handle_request(http::request<Body, http::basic_fields<Allocator>>&&);
+};
+
+class Server : public boost::enable_shared_from_this<Server> {
+  mutable std::shared_mutex mtx_;
+  std::unordered_set<WsConn*> clients_;
+
+public:
+  void connect(WsConn*);
+
+  void disconnect(WsConn*);
+
+  void broadcast_msg(Message) const;
+
+  // TODO: Take ref as ss?
+  void broadcast_msg_text(boost::shared_ptr<std::string const>) const;
+};
+
+/******************** Server ********************/
+
+void Server::connect(WsConn* ws) {
+  std::unique_lock lock(this->mtx_);
+  this->clients_.insert(ws);
+}
+
+void Server::disconnect(WsConn* ws) {
+  std::unique_lock lock(this->mtx_);
+  this->clients_.erase(ws);
+}
+
+void Server::broadcast_msg(Message msg) const {
+  auto msg_text = msg.serialize();
+  this->broadcast_msg_text(boost::make_shared<std::string const>(std::move(msg_text)));
+}
+
+// TODO: Take ref as ss?
+void Server::broadcast_msg_text(boost::shared_ptr<std::string const> ss) const {
+  std::shared_lock lock(this->mtx_);
+  for (auto ws : this->clients_) {
+    ws->send(ss);
+  }
+}
+
+/******************** Listener ********************/
+
+void Listener::fail(beast::error_code ec, char const* what) {
+  if (ec != net::error::operation_aborted) {
+    std::cerr << what << ": " << ec.message() << '\n';
+  }
+}
+
+void Listener::handle(beast::error_code ec, tcp::socket socket) {
+  if (ec) {
+    this->fail(ec, "accept");
+    return;
+  }
+  boost::make_shared<HttpSession>(std::move(socket), this->server_)->run();
+  this->acceptor_.async_accept(
+    net::make_strand(this->ioc_),
+    beast::bind_front_handler(&Listener::handle, this->shared_from_this())
+  );
+}
+
+Listener::Listener(net::io_context& ioc, tcp::endpoint endpoint, boost::shared_ptr<Server> const& server) : ioc_(ioc), acceptor_(ioc), server_(server) {
+  beast::error_code ec;
+
+  this->acceptor_.open(endpoint.protocol(), ec);
+  if (ec) {
+    this->fail(ec, "open");
+    return;
+  }
+
+  this->acceptor_.set_option(net::socket_base::reuse_address(true), ec);
+  if (ec) {
+    this->fail(ec, "set_option");
+    return;
+  }
+
+  this->acceptor_.bind(endpoint, ec);
+  if (ec) {
+    this->fail(ec, "bind");
+    return;
+  }
+
+  this->acceptor_.listen(net::socket_base::max_listen_connections, ec);
+  if (ec) {
+    this->fail(ec, "listen");
+    return;
+  }
+}
+
+void Listener::run() {
+  this->acceptor_.async_accept(
+    net::make_strand(this->ioc_),
+    beast::bind_front_handler(&Listener::handle, this->shared_from_this())
+  );
+}
+
+/******************** WsConn ********************/
+
+void WsConn::fail(beast::error_code ec, char const* what) {
+  /*
+  if (ec != net::error::operation_aborted && ec != websocket::error::closed) {
+    std::cerr << what << ": " << ec.message() << '\n';
+  }
+  */
+}
+
+void WsConn::accept(beast::error_code ec) {
+  /*
+  if (ec) {
+    this->fail(ec, "accept");
+    return;
+  }
+  // Send connect message
+  this->server_->connect(this);
+  this->ws_.async_read(this->buffer_, beast::bind_front_handler(
+    &WsConn::handle, this->shared_from_this()
+  ));
+  */
+}
+
+void WsConn::handle(beast::error_code ec, size_t bytes_transferred) {
+  /*
+  if (ec) {
+    this->fail(ec, "handle");
+    return;
+  }
+  auto json_msg = beast::buffers_to_string(this->buffer_.data());
+  try {
+    Message msg = Message(json_msg);
+    this->server_->broadcast_msg(msg);
+  } catch (std::exception &e) {
+    Message msg = Message(Action::Error, "bad message");
+    json_msg = msg.serialize();
+    this->send(boost::make_shared<std::string const>(json_msg));
+  }
+  this->ws_.async_read(this->buffer_, beast::bind_front_handler(
+    &WsConn::handle, this->shared_from_this()
+  ));
+  */
+}
+
+void WsConn::on_write(beast::error_code ec, std::size_t bytes_transferred) {
+  /*
+  if (ec) {
+    this->fail(ec, "write");
+    return;
+  }
+  this->queue_.pop();
+
+  if (!this->queue_.empty()) {
+    this->ws_.async_write(net::buffer(*this->queue_.front()), beast::bind_front_handler(
+      &WsConn::on_write, this->shared_from_this()
+    ));
+  }
+  */
+}
+
+void WsConn::on_send(boost::shared_ptr<std::string const> const& ss) {
+  this->queue_.push(ss);
+  // Check if we are already writing
+  if (this->queue_.size() > 1) {
+    return;
+  }
+  // If not, send immediately
+  this->ws_.async_write(net::buffer(*this->queue_.front()), beast::bind_front_handler(
+    &WsConn::on_write, this->shared_from_this()
+  ));
+}
+
+WsConn::WsConn(tcp::socket&& socket, boost::shared_ptr<Server> const& server)
+  : ws_(std::move(socket)), server_(server) {}
+
+WsConn::~WsConn() {
+  // Send disconnect message
+  this->server_->disconnect(this);
+}
+
+template<class Body, class Allocator>
+void WsConn::run(http::request<Body, http::basic_fields<Allocator>> req) {
+  /*
+  this->ws_.set_option(websocket::stream_base::timeout::suggested(
+    beast::role_type::server
+  ));
+  */
+
+  // Set a decorator to change the Server of the handshake
+  /*
+  this->ws_.set_option(websocket::stream_base::decorator(
+    [](websocket::response_type& res) {
+      res.set(http::field::server, std::string(BOOST_BEAST_VERSION_STRING) +
+        " wschat-cpp");
+    }
+  ));
+  */
+
+  /* TODO: DELETE
+  // Accept the websocket handshake
+  this->ws_.async_accept(req, beast::bind_front_handler(
+      &WsConn::accept, this->shared_from_this()
+    ));
+    */
+}
+
+void WsConn::send(boost::shared_ptr<std::string const> const& ss) {
+  /*
+  // Post to the strand to ensure the members of `this` aren't accessed
+  // concurrently.
+  net::post(this->ws_.get_executor(), beast::bind_front_handler(
+    &WsConn::on_send, this->shared_from_this(), ss
+  ));
+  */
+}
+
+/******************** HttpSession ********************/
+
+void HttpSession::fail(beast::error_code ec, char const* what) {
+  if (ec != net::error::operation_aborted) {
+    std::cerr << what << ": " << ec.message() << '\n';
+  }
+}
+
+void HttpSession::do_read() {
+  // Construct a new parser for each message
+  this->parser_.emplace();
+  // Apply a reasonable limit to the allowed size of the body to prevent
+  // abuse.
+  //this->parser_->body_limit(10000);
+  //this->stream_.expires_after(std::chrono::seconds(30));
+
+  http::async_read(
+    this->stream_, this->buffer_, this->parser_->get(),
+    beast::bind_front_handler(
+      &HttpSession::handle, this->shared_from_this()
+    )
+  );
+}
+
+void HttpSession::handle(beast::error_code ec, std::size_t) {
+  if (ec) {
+    if (ec == http::error::end_of_stream) {
+      this->stream_.socket().shutdown(tcp::socket::shutdown_send, ec);
+    } else {
+      this->fail(ec, "read");
+    }
+    return;
+  }
+
+  if (websocket::is_upgrade(this->parser_->get())) {
+    boost::make_shared<WsConn>(
+      this->stream_.release_socket(), this->server_
+    )->run(this->parser_->release());
+    return;
+  }
+
+  // Handle request
+  http::message_generator msg = HttpSession::handle_request(this->parser_->release());
+  bool keep_alive = msg.keep_alive();
+  auto self = this->shared_from_this();
+
+  // Send the response
+  beast::async_write(
+    this->stream_, std::move(msg),
+    [self, keep_alive](beast::error_code ec, std::size_t bytes) {
+      self->on_write(ec, bytes, keep_alive);
+    }
+  );
+}
+void HttpSession::on_write(beast::error_code ec, std::size_t, bool keep_alive) {
+  if (ec) {
+    this->fail(ec, "write");
+    return;
+  }
+  if (!keep_alive) {
+    this->stream_.socket().shutdown(tcp::socket::shutdown_send, ec);
+    return;
+  }
+  // Read another request
+  this->do_read();
+}
+
+HttpSession::HttpSession(tcp::socket&& socket, boost::shared_ptr<Server> const& server)
+  : stream_(std::move(socket)), server_(server) {
+  }
+
+void HttpSession::run() {
+  this->do_read();
+}
+
+template<class Body, class Allocator>
+http::message_generator handle_request(http::request<Body, http::basic_fields<Allocator>>&& req) {
+  // For right now, send not found for anything that isn't the base path.
+
+  if (req.target().empty() || req.target()[0] == '/') {
+    http::response<http::string_body> res{http::status::bad_request, req.version()};
+    //res.set(http::field::server, BOOST_BEAST_VERSION_STRING);
+    res.set(http::field::content_type, "text/html");
+    res.keep_alive(req.keep_alive());
+    res.body() = "not websocket protocol";
+    res.prepare_payload();
+    return res;
+  }
+
+  http::response<http::string_body> res{http::status::not_found, req.version()};
+  //res.set(http::field::server, BOOST_BEAST_VERSION_STRING);
+  res.set(http::field::content_type, "text/html");
+  res.keep_alive(req.keep_alive());
+  //res.body() = "The resource '" + std::string(target) + "' was not found.";
+  res.prepare_payload();
+  return res;
+}
+
+
+/*
+class Listener : public boost::enable_shared_from_this<Listener> {
+  net::io_context& ioc_;
+  tcp::acceptor acceptor_;
+  boost::shared_ptr<Server> server_;
+
+  void fail(beast::error_code ec, char const* what) {
+    if (ec != net::error::operation_aborted) {
+      std::cerr << what << ": " << ec.message() << '\n';
+    }
+  }
+
+  void handle(beast::error_code ec, tcp::socket socket) {
+    if (ec) {
+      this->fail(ec, "accept");
+      return;
+    }
+    boost::make_shared<HttpSession>(std::move(socket), this->server_)->run();
+    this->acceptor_.async_accept(
+      net::make_strand(this->ioc_),
+      beast::bind_front_handler(&Listener::handle, this->shared_from_this())
+    );
+  }
+
+public:
+  Listener(net::io_context& ioc, tcp::endpoint endpoint, boost::shared_ptr<Server> const& server) : ioc_(ioc), acceptor_(ioc), server_(server) {
+    beast::error_code ec;
+
+    this->acceptor_.open(endpoint.protocol(), ec);
+    if (ec) {
+      this->fail(ec, "open");
+      return;
+    }
+
+    this->acceptor_.set_option(net::socket_base::reuse_address(true), ec);
+    if (ec) {
+      this->fail(ec, "set_option");
+      return;
+    }
+
+    this->acceptor_.bind(endpoint, ec);
+    if (ec) {
+      this->fail(ec, "bind");
+      return;
+    }
+
+    this->acceptor_.listen(net::socket_base::max_listen_connections, ec);
+    if (ec) {
+      this->fail(ec, "listen");
+      return;
+    }
+  }
+
+  void run() {
+    this->acceptor_.async_accept(
+      net::make_strand(this->ioc_),
+      beast::bind_front_handler(&Listener::handle, this->shared_from_this())
+    );
+  }
+};
+
+class Server : public boost::enable_shared_from_this<Server> {
+  mutable std::shared_mutex mtx_;
+  std::unordered_set<WsConn*> clients_;
+
+public:
+  void connect(WsConn* ws) {
+    std::unique_lock lock(this->mtx_);
+    this->clients_.insert(ws);
+  }
+
+  void disconnect(WsConn* ws) {
+    std::unique_lock lock(this->mtx_);
+    this->clients_.erase(ws);
+  }
+
+  void broadcast_msg(Message msg) const {
+    auto msg_text = msg.serialize();
+    this->broadcast_msg_text(boost::make_shared<std::string const>(std::move(msg_text)));
+  }
+
+  // TODO: Take ref as ss?
+  void broadcast_msg_text(boost::shared_ptr<std::string const> ss) {
+    std::shared_lock lock(this->mtx_);
+    for (auto ws : this->clients_) {
+      ws->send(ss);
+    }
+  }
+};
+
+class WsConn : public boost::enable_shared_from_this<Server> {
+  beast::flat_buffer buffer_;
+  websocket::stream<beast::tcp_stream> ws_;
+  boost::shared_ptr<Server> server_;
+  std::queue<boost::shared_ptr<std::string const>> queue_;
+
+  void fail(beast::error_code ec, char const* what) {
+    if (ec != net::error::operation_aborted && ec != websocket::error::closed) {
+      std::cerr << what << ": " << ec.message() << '\n';
+    }
+  }
+  void accept(beast::error_code ec) {
+    if (ec) {
+      this->fail(ec, "accept");
+      return;
+    }
+    // Send connect message
+    this->server_->connect(this);
+    this->ws_.async_read(beast::bind_front_handler(
+      &WsConn::handle, this->shared_from_this()
+    ));
+  }
+  void handle(beast::error_code ec, size_t bytes_transferred) {
+    if (ec) {
+      this->fail(ec, "handle");
+      return;
+    }
+    auto json_msg = beast::buffers_to_string(this->buffer_.data());
+    try {
+      Message message = Message(json_msg);
+      this->server_->broadcast_msg(msg);
+    } catch (std::exception &e) {
+      Message msg = Message(Action::Error, "bad message");
+      json_msg = msg.serialize();
+      this->send(boost::make_shared<std::string const>(json_msg));
+    }
+    this->ws_.async_read(this->buffer_, beast::bind_front_handler(
+      &WsConn::handle, this->shared_from_this()
+    ));
+  }
+  void on_write(beast::error_code ec, std::size_t bytes_transferred) {
+    if (ec) {
+      this->fail(ec, "write");
+      return;
+    }
+    //this->queue_.erase(this->queue_.begin());
+
+    if (!this->queue_.empty()) {
+      //this->ws_.async_write(net::buffer(*this->queue_.front()), beast::bind_front_handler(
+      this->ws_.async_write(net::buffer(*this->queue_.pop()), beast::bind_front_handler(
+        &WsConn::on_write, this->shared_from_this()
+      ));
+    }
+  }
+  void on_send(boost::shared_ptr<std::string const> const& ss) {
+    this->queue_.push(ss);
+    // Check if we are already writing
+    if (this->queue_.size() > 1) {
+      return;
+    }
+    // If not, send immediately
+    //this->ws_.async_write(net::buffer(*this->queue_.front(), beast::bind_front_handler(
+    this->ws_.async_write(net::buffer(*this->queue_.pop(), beast::bind_front_handler(
+      &WsConn::on_write, this->shared_from_this()
+    ));
+  }
+
+public:
+  WsConn(tcp::socket&& socket, boost::shared_ptr<Server> const& server)
+    : ws_(std::move(socket)), server_(server) {}
+  ~WsConn() {
+    // Send disconnect message
+    this->server_->disconnect(this);
+  }
+
+  template<class Body, class Allocator>
+  void run(http::request<Body, http::basic_fields<Allocator>> req) {
+    //this->ws_.set_option(websocket::stream_base::timeout::suggested(
+      //beast::role_type::server
+    //));
+
+    // Set a decorator to change the Server of the handshake
+    //this->ws_.set_option(websocket::stream_base::decorator(
+      //[](websocket::response_type& res) {
+        //res.set(http::field::server, std::string(BOOST_BEAST_VERSION_STRING) +
+          //" wschat-cpp");
+      //}
+    //));
+    //
+
+    // Accept the websocket handshake
+    this->ws_.async_accept(req, beast::bind_front_handler(
+        &WsChat::accept, this->shared_from_this()
+      ));
+  }
+
+  void send(boost::shared_ptr<std::string const> const& ss) {
+    // Post to the strand to ensure the members of `this` aren't accessed
+    // concurrently.
+    net::post(this->ws_.get_executor(), beast::bind_front_handler(
+      &WsConn::on_send, this->shared_from_this(), ss
+    ));
+  }
+};
+
+class HttpSession: public boost::enable_shared_from_this<HttpSession> {
+  beast::tcp_stream stream_;
+  beast::flat_buffer buffer_;
+  boost::shared_ptr<Server> server_;
+  // The parser is stored as optional so we can construct it from scratch at
+  // beginning of each new message.
+  boost::optional<http::request_parser<http::string_body>> parser_;
+
+  struct send_lambda;
+
+  void fail(beast::error_code ec, char const* what) {
+    if (ec != net::error::operation_aborted) {
+      std::cerr < what << ": " << ec.message() << '\n';
+    }
+  }
+  void do_read() {
+    // Construct a new parser for each message
+    this->parser_.emplace();
+    // Apply a reasonable limit to the allowed size of the body to prevent
+    // abuse.
+    //this->parser_->body_limit(10000);
+    //this->stream_.expires_after(std::chrono::seconds(30));
+
+    http::async_read(
+      this->stream_, this->buffer_, this->parser_->get(),
+      beast::bind_front_handler(
+        &HttpSession::handle, this->shared_from_this()
+      )
+    );
+  }
+  void handle(beast::error_code ec, std::size_t) {
+    if (ec) {
+      if (ec == http::error::end_of_stream) {
+        this->stream_.socket().shutdown(tcp::socket::shutdown_send, ec);
+      } else {
+        this->fail(ec, "read");
+      }
+      return;
+    }
+
+    if (websocket::is_upgrade(this->parser_->get())) {
+      boost::make_shared<WsConn>(
+        this->stream_.release_socket(), this->server_
+      )->run(this->parser_->release());
+      return;
+    }
+
+    // Handle request
+    http::message_generator msg = HttpSession::handle_request(this->parser_->release());
+    bool keep_alive = msg.keep_alive();
+    auto self = this->shared_from_this();
+
+    // Send the response
+    beast::async_write(
+      this->stream_, std::move(msg),
+      [self, keep_alive](beast::error_code ec, std::size_t bytes) {
+        self->on_write(ec, bytes, keep_alive);
+      }
+    );
+  }
+  void on_write(beast::error_code ec, std::size_t, bool keep_alive) {
+    if (ec) {
+      this->fail(ec, "write");
+      return;
+    }
+    if (!keep_alive) {
+      this->stream_.socket().shutdown(tcp::socket::shutdown_send, ec);
+      return;
+    }
+    // Read another request
+    this->do_read();
+  }
+
+public:
+  HttpSession(tcp::socket&& socket, boost::shared_ptr<Server> const& server)
+    : stream_(std::move(socket)), server_(server) {
+    }
+
+  void run() {
+    this->do_read();
+  }
+
+  template<class Body, class Allocator>
+  http::message_generator handle_request(http::request<Body, http::basic_fields<Allocator>>&& req) {
+    // For right now, send not found for anything that isn't the base path.
+
+    if (req.target().empty() || req.target()[0] == '/') {
+      http::response<http::string_body> res{http::status::bad_request, req.version()};
+      //res.set(http::field::server, BOOST_BEAST_VERSION_STRING);
+      res.set(http::field::content_type, "text/html");
+      res.keep_alive(req.keep_alive());
+      res.body() = "not websocket protocol";
+      res.prepare_payload();
+      return res;
+    }
+
+    http::response<http::string_body> res{http::status::not_found, req.version()};
+    //res.set(http::field::server, BOOST_BEAST_VERSION_STRING);
+    res.set(http::field::content_type, "text/html");
+    res.keep_alive(req.keep_alive());
+    //res.body() = "The resource '" + std::string(target) + "' was not found.";
+    res.prepare_payload();
+    return res;
+  }
+};
+*/
